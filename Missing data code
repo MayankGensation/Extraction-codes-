@@ -1,0 +1,285 @@
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+import os
+
+def setup_driver():
+    # Setup WebDriver
+    chrome_driver_path = r"C:\Users\sanju\OneDrive\Desktop\web scraping\chromedriver.exe"
+    url = "https://sec2021.bihar.gov.in/claim-objection/Result1.aspx?D=0&PO=1"
+
+    options = webdriver.ChromeOptions()
+    options.add_argument("--start-maximized")
+    service = Service(chrome_driver_path)
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.get(url)
+    return driver
+
+def get_dropdown_options(driver, wait, dropdown_xpath):
+    try:
+        dropdown = wait.until(EC.presence_of_element_located((By.XPATH, dropdown_xpath)))
+        return [opt.text.strip() for opt in Select(dropdown).options if opt.text.strip() not in ["Select", "--select--"]]
+    except:
+        return []
+
+def select_dropdown_option(driver, wait, dropdown_xpath, value, max_retries=3):
+    for _ in range(max_retries):
+        try:
+            dropdown = wait.until(EC.element_to_be_clickable((By.XPATH, dropdown_xpath)))
+            Select(dropdown).select_by_visible_text(value)
+            driver.execute_script("arguments[0].dispatchEvent(new Event('change'))", dropdown)
+            time.sleep(2)
+            return True
+        except Exception as e:
+            print(f"⚠️ Unable to select {value}. Retrying... ({_ + 1}/{max_retries})")
+    print(f"❌ Unable to select {value} after {max_retries} attempts.")
+    return False
+
+def close_popups(driver):
+    try:
+        alert = driver.switch_to.alert
+        alert.dismiss()
+        print("⚠️ Closed pop-up alert.")
+    except:
+        pass
+
+def extract_data(driver, wait, district, block, panchayat, ward):
+    try:
+        # Extract table data
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        table = soup.find("table", {"id": "ctl00_ContentPlaceHolder1_RPDetails"})
+        if table:
+            headers = [th.text.strip() for th in table.find_all("th")]
+            rows = [[td.text.strip() for td in row.find_all("td")] for row in table.find_all("tr")[1:]]
+            
+            data = []
+            for row in rows:
+                row.insert(0, ward)
+                row.insert(0, panchayat)
+                row.insert(0, block)
+                row.insert(0, district)
+                data.append(row)
+            
+            return data, headers
+        return None, None
+    except Exception as e:
+        print(f"❌ Failed to extract table: {e}")
+        return None, None
+
+def main():
+    # User inputs
+    target_post = input("Enter the post to scrape (e.g., 'ग्राम पंचायत के सदस्य'): ")
+    target_districts_input = input("Enter the districts to scrape (comma-separated, e.g., 'दरभंगा,मधुबनी' or leave empty for all districts): ")
+    target_block = input("Enter the block to scrape (leave empty for all blocks): ")
+    target_panchayats_input = input("Enter the panchayats to scrape (comma-separated, e.g., 'पंचायत1,पंचायत2' or leave empty for all panchayats): ")
+    target_wards_input = input("Enter the wards to scrape (comma-separated, e.g., '1,2,3' or leave empty for all wards): ")
+    
+    # Convert ward input to list of integers
+    target_wards = []
+    if target_wards_input.strip():
+        try:
+            target_wards = [int(ward.strip()) for ward in target_wards_input.split(',')]
+        except ValueError:
+            print("❌ Invalid ward numbers. Please enter numbers separated by commas.")
+            return
+
+    # Convert panchayat input to list
+    target_panchayats = []
+    if target_panchayats_input.strip():
+        target_panchayats = [panchayat.strip() for panchayat in target_panchayats_input.split(',')]
+
+    # Convert district input to list
+    target_districts = []
+    if target_districts_input.strip():
+        target_districts = [district.strip() for district in target_districts_input.split(',')]
+
+    driver = setup_driver()
+    wait = WebDriverWait(driver, 10)  # Increased wait time
+
+    # Get available posts first
+    posts = get_dropdown_options(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddl_Post"]')
+    print("\nAvailable posts:")
+    for i, post in enumerate(posts, 1):
+        print(f"{i}. {post}")
+    
+    # Select the post with retries
+    if not select_dropdown_option(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddl_Post"]', target_post, max_retries=5):
+        print("\n❌ Failed to select post after multiple attempts.")
+        print("Please verify the post name is correct from the list above.")
+        driver.quit()
+        return
+
+    # Get districts
+    districts = get_dropdown_options(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddlDistrict"]')
+    print("\nAvailable districts:")
+    for i, district in enumerate(districts, 1):
+        print(f"{i}. {district}")
+
+    # Filter districts if specific districts are requested
+    if target_districts:
+        # Check if all requested districts exist
+        missing_districts = [d for d in target_districts if d not in districts]
+        if missing_districts:
+            print(f"⚠️ The following districts were not found: {missing_districts}")
+            print("Available districts:", districts)
+            driver.quit()
+            return
+        districts = target_districts
+
+    all_data = []
+    headers = None
+
+    for district in districts:
+        print(f"\nProcessing district: {district}")
+        
+        # Select district
+        if not select_dropdown_option(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddlDistrict"]', district):
+            print(f"❌ Failed to select district {district}. Skipping.")
+            continue
+        
+        # Get blocks
+        blocks = get_dropdown_options(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddlBlock"]')
+        if target_block and target_block not in blocks:
+            print(f"❌ Block '{target_block}' not found in district {district}.")
+            print(f"Available blocks in {district}: {blocks}")
+            continue
+
+        # Filter blocks if specific block is requested
+        if target_block:
+            blocks = [target_block]
+
+        for block in blocks:
+            if not select_dropdown_option(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddlBlock"]', block):
+                print(f"⚠️ Failed to select block {block}. Skipping.")
+                continue
+            
+            # Get panchayats
+            panchayats = get_dropdown_options(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddlPanchayat"]')
+            print(f"\nAvailable panchayats in {block}, {district}:")
+            for i, panchayat in enumerate(panchayats, 1):
+                print(f"{i}. {panchayat}")
+
+            # Filter panchayats if specific panchayats are requested
+            if target_panchayats:
+                # Check if all requested panchayats exist
+                missing_panchayats = [p for p in target_panchayats if p not in panchayats]
+                if missing_panchayats:
+                    print(f"⚠️ The following panchayats were not found in {block}: {missing_panchayats}")
+                    print("Available panchayats:", panchayats)
+                    continue
+                panchayats = target_panchayats
+
+            for panchayat in panchayats:
+                if not select_dropdown_option(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddlPanchayat"]', panchayat):
+                    print(f"⚠️ Failed to select panchayat {panchayat}. Skipping.")
+                    continue
+                
+                # Get wards
+                try:
+                    wards = get_dropdown_options(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddlWard"]')
+                    if not wards:
+                        print(f"⚠️ No ward dropdown found in {panchayat}. This panchayat might not have ward divisions.")
+                        print("Proceeding without ward selection...")
+                        
+                        # Click the "Filter" button without ward selection
+                        try:
+                            filter_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="ctl00_ContentPlaceHolder1_btnFilter"]')))
+                            driver.execute_script("arguments[0].click();", filter_button)
+                            time.sleep(3)
+                        except Exception as e:
+                            print(f"❌ Failed to click filter button: {e}")
+                            continue
+
+                        # Extract data without ward
+                        data, current_headers = extract_data(driver, wait, district, block, panchayat, "No Ward")
+                        if data and current_headers:
+                            all_data.extend(data)
+                            headers = current_headers
+                            print(f"✅ Extracted data for {district} > {block} > {panchayat} (No Ward)")
+                        else:
+                            print(f"⚠️ No data found for {district} > {block} > {panchayat} (No Ward)")
+                        continue
+
+                    print(f"\nAvailable wards in {panchayat}:")
+                    for i, ward in enumerate(wards, 1):
+                        print(f"{i}. {ward}")
+                    
+                    # Filter wards based on user input
+                    if target_wards:
+                        # Convert ward options to integers for comparison
+                        available_wards = []
+                        for ward in wards:
+                            try:
+                                ward_num = int(ward.split()[0])
+                                available_wards.append(ward_num)
+                            except (ValueError, IndexError):
+                                continue
+                        
+                        # Find matching wards
+                        matching_wards = [ward for ward in available_wards if ward in target_wards]
+                        
+                        if not matching_wards:
+                            print(f"⚠️ None of the specified wards found in panchayat {panchayat}. Available wards: {available_wards}")
+                            print("⚠️ Skipping this panchayat due to no matching wards.")
+                            continue
+                        
+                        # Convert back to string format for selection
+                        wards = [f"{ward} वार्ड" for ward in matching_wards]
+                        print(f"Selected wards: {wards}")  # Debug information
+                        
+                        # Check for missing wards
+                        missing_wards = [ward for ward in target_wards if ward not in available_wards]
+                        if missing_wards:
+                            print(f"⚠️ The following wards are not available in {panchayat}: {missing_wards}")
+                            print(f"Continuing with available wards: {matching_wards}")
+                    else:
+                        # If no specific wards provided, use all wards
+                        wards = [ward for ward in wards if ward.split()[0].isdigit()]
+
+                    for ward in wards:
+                        if not select_dropdown_option(driver, wait, '//*[@id="ctl00_ContentPlaceHolder1_ddlWard"]', ward):
+                            print(f"⚠️ Failed to select ward {ward}. Skipping this ward.")
+                            continue
+                            
+                        close_popups(driver)
+
+                        # Click the "Filter" button
+                        try:
+                            filter_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="ctl00_ContentPlaceHolder1_btnFilter"]')))
+                            driver.execute_script("arguments[0].click();", filter_button)
+                            time.sleep(3)
+                        except Exception as e:
+                            print(f"❌ Failed to click filter button: {e}")
+                            continue
+
+                        # Extract data
+                        data, current_headers = extract_data(driver, wait, district, block, panchayat, ward)
+                        if data and current_headers:
+                            all_data.extend(data)
+                            headers = current_headers
+                            print(f"✅ Extracted data for {district} > {block} > {panchayat} > {ward}")
+                        else:
+                            print(f"⚠️ No data found for {district} > {block} > {panchayat} > {ward}")
+                except Exception as e:
+                    print(f"⚠️ Error processing wards for {panchayat}: {e}")
+                    print("Skipping ward processing for this panchayat...")
+                    continue
+
+    # Save data to CSV
+    if all_data and headers:
+        output_file = f"results_{target_districts_input}_{target_block}_{target_panchayats_input}_{target_wards_input}.csv"
+        df = pd.DataFrame(all_data, columns=["District", "Block", "Panchayat", "Ward"] + headers)
+        df.to_csv(output_file, index=False, encoding="utf-8-sig")
+        print(f"✅ Data saved to '{output_file}'")
+    else:
+        print("❌ No data was extracted.")
+
+    driver.quit()
+
+if __name__ == "__main__":
+    main() 
